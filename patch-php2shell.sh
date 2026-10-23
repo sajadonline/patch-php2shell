@@ -35,7 +35,10 @@
 # and test on staging first. No warranty.
 # -----------------------------------------------------------------------------
 
-set -euo pipefail
+# No `set -e`: this tool deliberately probes several PHP binaries that may each
+# fail or be absent, and must not abort the whole scan on the first one.
+# Build/swap steps below guard their own failures explicitly with `|| die`.
+set -uo pipefail
 
 # --- fixed versions table -----------------------------------------------------
 declare -A FIXED=( [8.5]=8.5.12 [8.4]=8.4.27 [8.3]=8.3.36 [8.2]=8.2.35 )
@@ -73,6 +76,14 @@ done
 ver_ge() { [ "$1" = "$2" ] && return 0; [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
 
 branch_of() { echo "$1" | awk -F. '{print $1"."$2}'; }
+
+# version of a php binary, safe for every SAPI (cli/fpm/cgi):
+# parse `-v` output rather than running `-r`, which only CLI accepts.
+# Parsing `-v` (not `-r`) works on php-fpm and php-cgi too. The binary call is
+# wrapped so a non-zero/absent SAPI can never abort the surrounding pipeline.
+php_version_of() {
+  { "$1" -v 2>/dev/null || true; } | sed -n '1s/^PHP \([0-9][0-9.]*\).*/\1/p' | head -1
+}
 
 # classify a full version string -> echoes: FIXED | VULN | EOL
 classify() {
@@ -113,7 +124,7 @@ report() {
   log "scanning PHP binaries ..."
   while read -r bin; do
     [ -x "$bin" ] || continue
-    local v st; v="$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+    local v st; v="$(php_version_of "$bin")"
     [ -n "$v" ] || continue
     st="$(classify "$v")"
     case "$st" in
@@ -161,7 +172,7 @@ packaged_fix() {
 build_from_source() {
   local php_bin; php_bin="$(command -v php || true)"
   [ -n "$php_bin" ] || die "no php on PATH to model the build on."
-  local v b; v="$("$php_bin" -r 'echo PHP_VERSION;')"; b="$(branch_of "$v")"
+  local v b; v="$(php_version_of "$php_bin")"; b="$(branch_of "$v")"
 
   case " $OFFICIAL_BACKPORT_BRANCHES " in
     *" $b "*) : ;;
