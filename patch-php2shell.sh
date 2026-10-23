@@ -105,6 +105,58 @@ detect_php_bins() {
   } | sort -u
 }
 
+# Compute a drop-in ./configure line when the real options are unavailable.
+# Strategy: a minimal core (--disable-all) that re-enables only the SAPIs you
+# run and the extensions your PHP has compiled-in statically (everything else
+# on your system is a shared .so and loads into the new binary unchanged,
+# because the PHP version — and thus the extension ABI — does not change).
+derive_configure() {
+  local php_bin="$1"
+  local extdir inipath scandir libdir trim='s/^[[:space:]]*//;s/[[:space:]]*$//'
+  inipath="$("$php_bin" -i 2>/dev/null | awk -F'=> ' '/^Configuration File \(php.ini\) Path/{print $2; exit}' | sed "$trim")"
+  scandir="$("$php_bin" -i 2>/dev/null | awk -F'=> ' '/Scan this dir for additional \.ini files/{print $2; exit}' | sed "$trim")"
+  extdir="$("$php_bin" -r 'echo ini_get("extension_dir");' 2>/dev/null)"
+  # absolute libdir, matching where the distro keeps the extension modules
+  libdir=/usr/lib; case "$extdir" in */lib64/*) libdir=/usr/lib64;; esac
+
+  # statically built-in modules = loaded modules that have no matching .so file
+  local shared static mod flags=""
+  shared="$(ls "$extdir" 2>/dev/null | sed 's/\.so$//' | tr 'A-Z' 'a-z' | sort -u)"
+  static="$("$php_bin" -m 2>/dev/null | grep -v '^\[' | grep -v ' ' | tr 'A-Z' 'a-z' | sort -u \
+            | comm -23 - <(echo "$shared"))"
+  for mod in $static; do
+    case "$mod" in
+      openssl)  flags="$flags --with-openssl" ;;
+      zlib)     flags="$flags --with-zlib" ;;
+      readline) flags="$flags --with-readline" ;;
+      libxml)   flags="$flags --with-libxml" ;;
+      pcntl)    flags="$flags --enable-pcntl" ;;
+      session)  flags="$flags --enable-session" ;;
+      filter)   flags="$flags --enable-filter" ;;
+      sodium)   flags="$flags --with-sodium" ;;
+      bz2)      flags="$flags --with-bz2" ;;
+      # Core/standard/spl/pcre/date/reflection/hash/json are always built in.
+      core|standard|spl|pcre|date|reflection|hash|json|ctype|tokenizer) ;;
+      *) warn "built-in module '$mod' has no known configure flag; skipping (verify after)" ;;
+    esac
+  done
+  local sapis="--enable-cli"
+  command -v php-fpm >/dev/null && sapis="$sapis --enable-fpm"
+  command -v php-cgi >/dev/null && sapis="$sapis --enable-cgi"
+
+  # Modern distros (Remi, Debian, RHEL8+) build PHP 7.4+ against the SYSTEM
+  # pcre2 (--with-external-pcre). Their shared extensions — notably opcache —
+  # then reference external pcre2_*_8 symbols, so the rebuilt core must use the
+  # same external pcre2 or those .so fail with "undefined symbol: pcre2_...".
+  # Use external pcre2 whenever it is available; otherwise fall back to bundled.
+  if pkg-config --exists libpcre2-8 2>/dev/null || ls /usr/include/pcre2.h >/dev/null 2>&1; then
+    flags="$flags --with-external-pcre"
+  fi
+
+  printf -- '--prefix=/usr --libdir=%s --disable-all %s %s --with-config-file-path=%s --with-config-file-scan-dir=%s' \
+    "$libdir" "$sapis" "$flags" "${inipath:-/etc}" "${scandir:-/etc/php.d}"
+}
+
 restart_php_services() {
   log "restarting PHP / web services that are active ..."
   local svc
@@ -179,17 +231,36 @@ build_from_source() {
     *) die "branch $b has no official source backport. For supported branches use the package manager; for <7.4 there is no vetted upstream patch." ;;
   esac
 
-  command -v git  >/dev/null || die "git is required."
-  command -v gcc  >/dev/null || die "a C toolchain (gcc/make/autoconf + php build deps) is required. On RHEL: dnf groupinstall 'Development Tools'; dnf builddep php."
-  command -v php-config >/dev/null || die "php-config is required to reproduce your current build options."
+  command -v git  >/dev/null || die "git is required to fetch the official patch."
+  command -v gcc  >/dev/null || die "a C toolchain and PHP core build deps are required. Install them first:
+    RHEL/Rocky 8:  dnf install -y epel-release dnf-plugins-core && dnf config-manager --set-enabled powertools &&
+                   dnf install -y git gcc make autoconf bison re2c pkgconf-pkg-config openssl-devel zlib-devel libxml2-devel readline-devel pcre2-devel
+    Debian/Ubuntu: apt-get install -y git build-essential autoconf bison re2c pkg-config libssl-dev zlib1g-dev libxml2-dev libreadline-dev libpcre2-dev"
 
-  local cfgopts; cfgopts="$(php-config --configure-options)"
-  log "current PHP build options:"; echo "    $cfgopts"
+  # We deliberately build a MINIMAL core (cli + your SAPIs + only the
+  # statically-built-in extensions), NOT a full clone of the distro's configure.
+  # Why: the CVE fix lives in PHP core, which is compiled into every SAPI
+  # binary. Every other extension on your system is a shared .so that loads into
+  # the new binary unchanged, because the PHP version — and thus the extension
+  # ABI — does not change. A minimal build needs only a handful of -devel libs
+  # and avoids the fragile, dependency-heavy job of reproducing flags like
+  # --enable-dtrace / --with-external-pcre / --enable-embed that distro builds use.
+  local cfgopts; cfgopts="$(derive_configure "$php_bin")"
+  log "minimal drop-in configure (your shared extensions are preserved as-is):"
+  echo "    $cfgopts"
+
+  # Where your current PHP keeps its shared extensions and scans for .ini files.
+  # The rebuilt core's compiled-in default may differ, so we pin extension_dir
+  # afterwards to keep every existing .so loading from the same place.
+  local scan_dir ext_dir trim='s/^[[:space:]]*//;s/[[:space:]]*$//'
+  scan_dir="$("$php_bin" -i 2>/dev/null | awk -F'=> ' '/Scan this dir for additional \.ini files/{print $2; exit}' | sed "$trim")"
+  ext_dir="$("$php_bin" -r 'echo ini_get("extension_dir");' 2>/dev/null)"
+
   warn "This will compile PHP from the official security branch and replace the SAPI binaries in place."
   warn "The SAME version string ($v) keeps your extension ABI, so ionCube/OPcache keep working."
   read -r -p "Type YES to continue: " c; [ "$c" = "YES" ] || die "aborted."
 
-  local work; work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+  local work; work="$(mktemp -d)"; trap 'rm -rf "${work:-}"' EXIT
   local branch="PHP-${b}-CVE-2026-109618-109619"
   log "cloning official php-src branch $branch ..."
   git clone --depth 1 --branch "$branch" https://github.com/php/php-src.git "$work/php-src" \
@@ -218,18 +289,39 @@ build_from_source() {
     ok "replaced $tgt (backup: $bdir/$(basename "$tgt"))"
   done
   echo "$bdir" > "$BACKUP_ROOT/.last"
+
+  # Pin extension_dir so the rebuilt core finds your existing shared .so files.
+  if [ -n "$ext_dir" ] && [ -n "$scan_dir" ] && [ -d "$scan_dir" ]; then
+    local pin="$scan_dir/00-php2shell-extension-dir.ini"
+    printf '; added by patch-php2shell: keep the rebuilt PHP looking where your extensions already live\nextension_dir=%s\n' "$ext_dir" > "$pin"
+    echo "$pin" > "$bdir/.added_ini"
+    ok "pinned extension_dir=$ext_dir ($pin)"
+  fi
+
   restart_php_services
 
   log "verifying ..."
-  "$(command -v php)" -v >/dev/null 2>&1 \
-    && ok "patched PHP runs. Keep the backup at $bdir until you have tested your application." \
-    || { err "patched PHP failed to run — rolling back automatically."; MODE=rollback; rollback; die "rolled back."; }
+  if ! "$(command -v php)" -v >/dev/null 2>&1; then
+    err "patched PHP failed to run — rolling back automatically."; MODE=rollback; rollback; die "rolled back."
+  fi
+  local extfail; extfail="$("$(command -v php)" -r ';' 2>&1 | grep -c -iE 'Unable to load dynamic library|Failed loading' || true)"
+  if [ "${extfail:-0}" -gt 0 ]; then
+    err "$extfail extension(s) fail to load under the rebuilt PHP — rolling back automatically."
+    "$(command -v php)" -r ';' 2>&1 | grep -iE 'Unable to load|Failed loading' | head -5 >&2
+    MODE=rollback; rollback; die "rolled back (your extensions must keep loading)."
+  fi
+  ok "patched PHP runs and all extensions load. Keep the backup at $bdir until you have tested your application."
 }
 
 rollback() {
   local bdir; bdir="$(cat "$BACKUP_ROOT/.last" 2>/dev/null || true)"
   [ -n "$bdir" ] && [ -d "$bdir" ] || die "no backup recorded under $BACKUP_ROOT."
   log "restoring binaries from $bdir ..."
+  # remove the extension_dir pin we added, if any
+  if [ -f "$bdir/.added_ini" ]; then
+    local ini; ini="$(cat "$bdir/.added_ini")"
+    [ -n "$ini" ] && [ -f "$ini" ] && rm -f "$ini" && ok "removed $ini"
+  fi
   local f
   for f in "$bdir"/*; do
     local name; name="$(basename "$f")"; local tgt; tgt="$(command -v "$name" || true)"
