@@ -40,8 +40,8 @@ sudo ./patch-php2shell.sh --rollback       # undo a source build
 
 - **Take a snapshot / backup** and test on staging first. This changes PHP on a live server.
 - The `--build-from-source` path needs a C toolchain and a few `-devel` libraries. Install them first:
-  - **RHEL / Rocky / Alma 8:** `dnf install -y epel-release dnf-plugins-core && dnf config-manager --set-enabled powertools && dnf install -y git gcc make autoconf bison re2c pkgconf-pkg-config openssl-devel zlib-devel libxml2-devel readline-devel pcre2-devel`
-  - **Debian / Ubuntu:** `apt-get install -y git build-essential autoconf bison re2c pkg-config libssl-dev zlib1g-dev libxml2-dev libreadline-dev libpcre2-dev`
+  - **RHEL / Rocky / Alma 8:** `dnf install -y epel-release dnf-plugins-core && dnf config-manager --set-enabled powertools && dnf install -y git gcc make autoconf bison re2c pkgconf-pkg-config openssl-devel zlib-devel libxml2-devel readline-devel pcre2-devel libacl-devel systemd-devel`
+  - **Debian / Ubuntu:** `apt-get install -y git build-essential autoconf bison re2c pkg-config libssl-dev zlib1g-dev libxml2-dev libreadline-dev libpcre2-dev libacl1-dev libsystemd-dev`
   - It builds a **minimal core** (CLI + your SAPIs + the statically-built-in extensions) and swaps only the `php` / `php-fpm` / `php-cgi` binaries. Every extension your distro ships as a shared `.so` keeps working untouched, because the PHP version — and the extension ABI — do not change.
 - The official patch **disables PHP's upload-progress feature** and makes out-of-memory
   conditions exit immediately. This is intentional and harmless for the vast majority of apps.

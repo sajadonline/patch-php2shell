@@ -144,6 +144,23 @@ derive_configure() {
   command -v php-fpm >/dev/null && sapis="$sapis --enable-fpm"
   command -v php-cgi >/dev/null && sapis="$sapis --enable-cgi"
 
+  # php-fpm started without -y reads $sysconfdir/php-fpm.conf by default (the
+  # typical systemd unit is just `php-fpm --nodaemonize`). Point sysconfdir at
+  # wherever php-fpm.conf already lives, or the rebuilt fpm can't find its
+  # config and fails to start. /etc on RHEL; /etc/php/<v>/fpm on Debian.
+  local sysconfdir=/etc fpmconf
+  fpmconf="$(find /etc -maxdepth 4 -name php-fpm.conf 2>/dev/null | head -1)"
+  [ -n "$fpmconf" ] && sysconfdir="$(dirname "$fpmconf")"
+  if command -v php-fpm >/dev/null; then
+    sapis="$sapis --sysconfdir=$sysconfdir"
+    # Distro FPM pools commonly use ACL (listen.acl_*) and the systemd unit is
+    # Type=notify. A minimal fpm lacking these rejects the existing pool config
+    # ('unknown entry listen.acl_users') or never signals readiness to systemd.
+    ls /usr/include/sys/acl.h >/dev/null 2>&1 && sapis="$sapis --with-fpm-acl"
+    { pkg-config --exists libsystemd 2>/dev/null || ls /usr/include/systemd/sd-daemon.h >/dev/null 2>&1; } \
+      && sapis="$sapis --with-fpm-systemd"
+  fi
+
   # Modern distros (Remi, Debian, RHEL8+) build PHP 7.4+ against the SYSTEM
   # pcre2 (--with-external-pcre). Their shared extensions — notably opcache —
   # then reference external pcre2_*_8 symbols, so the rebuilt core must use the
@@ -234,8 +251,8 @@ build_from_source() {
   command -v git  >/dev/null || die "git is required to fetch the official patch."
   command -v gcc  >/dev/null || die "a C toolchain and PHP core build deps are required. Install them first:
     RHEL/Rocky 8:  dnf install -y epel-release dnf-plugins-core && dnf config-manager --set-enabled powertools &&
-                   dnf install -y git gcc make autoconf bison re2c pkgconf-pkg-config openssl-devel zlib-devel libxml2-devel readline-devel pcre2-devel
-    Debian/Ubuntu: apt-get install -y git build-essential autoconf bison re2c pkg-config libssl-dev zlib1g-dev libxml2-dev libreadline-dev libpcre2-dev"
+                   dnf install -y git gcc make autoconf bison re2c pkgconf-pkg-config openssl-devel zlib-devel libxml2-devel readline-devel pcre2-devel libacl-devel systemd-devel
+    Debian/Ubuntu: apt-get install -y git build-essential autoconf bison re2c pkg-config libssl-dev zlib1g-dev libxml2-dev libreadline-dev libpcre2-dev libacl1-dev libsystemd-dev"
 
   # We deliberately build a MINIMAL core (cli + your SAPIs + only the
   # statically-built-in extensions), NOT a full clone of the distro's configure.
@@ -252,9 +269,13 @@ build_from_source() {
   # Where your current PHP keeps its shared extensions and scans for .ini files.
   # The rebuilt core's compiled-in default may differ, so we pin extension_dir
   # afterwards to keep every existing .so loading from the same place.
-  local scan_dir ext_dir trim='s/^[[:space:]]*//;s/[[:space:]]*$//'
+  local scan_dir ext_dir inc_path trim='s/^[[:space:]]*//;s/[[:space:]]*$//'
   scan_dir="$("$php_bin" -i 2>/dev/null | awk -F'=> ' '/Scan this dir for additional \.ini files/{print $2; exit}' | sed "$trim")"
   ext_dir="$("$php_bin" -r 'echo ini_get("extension_dir");' 2>/dev/null)"
+  # Distro builds bake a default include_path (e.g. .:/usr/share/pear:/usr/share/php)
+  # that a minimal build lacks; apps relying on system PEAR/PHP libraries (Smarty,
+  # etc.) then fail. Capture the current one and pin it too.
+  inc_path="$("$php_bin" -r 'echo get_include_path();' 2>/dev/null)"
 
   warn "This will compile PHP from the official security branch and replace the SAPI binaries in place."
   warn "The SAME version string ($v) keeps your extension ABI, so ionCube/OPcache keep working."
@@ -291,11 +312,15 @@ build_from_source() {
   echo "$bdir" > "$BACKUP_ROOT/.last"
 
   # Pin extension_dir so the rebuilt core finds your existing shared .so files.
-  if [ -n "$ext_dir" ] && [ -n "$scan_dir" ] && [ -d "$scan_dir" ]; then
-    local pin="$scan_dir/00-php2shell-extension-dir.ini"
-    printf '; added by patch-php2shell: keep the rebuilt PHP looking where your extensions already live\nextension_dir=%s\n' "$ext_dir" > "$pin"
+  if [ -n "$scan_dir" ] && [ -d "$scan_dir" ]; then
+    local pin="$scan_dir/00-php2shell-paths.ini"
+    {
+      echo "; added by patch-php2shell: make the rebuilt PHP match your old paths"
+      [ -n "$ext_dir" ]  && echo "extension_dir=$ext_dir"
+      [ -n "$inc_path" ] && echo "include_path=\"$inc_path\""
+    } > "$pin"
     echo "$pin" > "$bdir/.added_ini"
-    ok "pinned extension_dir=$ext_dir ($pin)"
+    ok "pinned extension_dir=$ext_dir include_path=$inc_path ($pin)"
   fi
 
   restart_php_services
